@@ -1,10 +1,14 @@
+import type {
+  DesktopBridge,
+  DesktopUpdateActionResult,
+  DesktopUpdateState,
+} from "@t3tools/contracts";
 import { DownloadIcon, RefreshCwIcon, RotateCwIcon, TriangleAlertIcon } from "lucide-react";
-import { useCallback, useState } from "react";
+import { type CSSProperties, useCallback, useState } from "react";
 import { isElectron } from "../../env";
 import { cn } from "../../lib/utils";
 import { ensureLocalApi } from "../../localApi";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
-import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
   canCheckForUpdate,
   getArm64IntelBuildWarningDescription,
@@ -20,7 +24,131 @@ import { showDesktopUpdateDownloadedToast } from "../desktopUpdate.toast";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Separator } from "../ui/separator";
 import { SidebarMenuItem } from "../ui/sidebar";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+
+const UPDATE_AVAILABLE_TOOLTIP_STYLE: CSSProperties = {
+  background:
+    "color-mix(in srgb, var(--update) 18%, color-mix(in srgb, var(--popover) var(--glass-opacity), transparent))",
+  borderColor: "var(--update-foreground)",
+};
+
+function updateActionErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function toastUpdateError(title: string, description: string) {
+  toastManager.add(
+    stackedThreadToast({
+      type: "error",
+      title,
+      description,
+    }),
+  );
+}
+
+function toastFailedUpdateAction(title: string, result: DesktopUpdateActionResult) {
+  if (!shouldToastDesktopUpdateActionResult(result)) return;
+  const actionError = getDesktopUpdateActionError(result);
+  if (!actionError) return;
+  toastUpdateError(title, actionError);
+}
+
+function startDownloadUpdate(bridge: DesktopBridge, onDone: () => void) {
+  void bridge
+    .downloadUpdate()
+    .then((result) => {
+      if (result.completed) {
+        showDesktopUpdateDownloadedToast(bridge, result.state);
+      }
+      toastFailedUpdateAction("Could not download update", result);
+    })
+    .catch((error) => {
+      toastUpdateError(
+        "Could not start update download",
+        updateActionErrorMessage(error, "An unexpected error occurred."),
+      );
+    })
+    .finally(onDone);
+}
+
+function startInstallUpdate(bridge: DesktopBridge, onDone: () => void) {
+  void bridge
+    .installUpdate()
+    .then((result) => {
+      toastFailedUpdateAction("Could not install update", result);
+    })
+    .catch((error) => {
+      toastUpdateError(
+        "Could not install update",
+        updateActionErrorMessage(error, "An unexpected error occurred."),
+      );
+    })
+    .finally(onDone);
+}
+
+function startCheckForUpdate(bridge: DesktopBridge, onDone: () => void) {
+  void bridge
+    .checkForUpdate()
+    .then((result) => {
+      if (result.checked) return;
+      toastUpdateError(
+        "Could not check for updates",
+        result.state.message ?? "Automatic updates are not available in this build.",
+      );
+    })
+    .catch((error) => {
+      toastUpdateError(
+        "Could not check for updates",
+        updateActionErrorMessage(error, "Update check failed."),
+      );
+    })
+    .finally(onDone);
+}
+
+function getSidebarUpdateTooltip(state: DesktopUpdateState | null, isUpdateState: boolean) {
+  if (isUpdateState) {
+    return state ? getDesktopUpdateButtonTooltip(state) : "Update available";
+  }
+  if (state?.status === "checking") {
+    return "Checking for updates…";
+  }
+  return "Check for updates";
+}
+
+/** Track around the update button. `percent` is 0–100; SVG `pathLength` makes dashoffset a percentage. */
+function DownloadProgressRing({ percent }: { readonly percent: number }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-0 size-full -rotate-90"
+      viewBox="0 0 32 32"
+    >
+      <circle
+        cx="16"
+        cy="16"
+        r="14.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        opacity="0.2"
+      />
+      <circle
+        cx="16"
+        cy="16"
+        r="14.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        pathLength="100"
+        strokeDasharray="100 100"
+        strokeDashoffset={100 - percent}
+        strokeLinecap="round"
+        className="transition-[stroke-dashoffset] duration-300 ease-out"
+      />
+    </svg>
+  );
+}
 
 function keyReleaseNoteItems(items: ReadonlyArray<string>) {
   const occurrences = new Map<string, number>();
@@ -35,7 +163,7 @@ function SidebarUpdateReleaseNotesTooltip({
   state,
   tooltip,
 }: {
-  readonly state: NonNullable<ReturnType<typeof useDesktopUpdateState>>;
+  readonly state: DesktopUpdateState;
   readonly tooltip: string;
 }) {
   if (state.channel !== "nightly" || state.releaseNotes.length === 0) {
@@ -70,7 +198,7 @@ function SidebarUpdateReleaseNotesTooltip({
               </h3>
               <ul className="mt-2 space-y-1.5 pl-4 text-xs leading-5 text-popover-foreground/90">
                 {keyReleaseNoteItems(releaseNote.items).map(({ item, key }) => (
-                  <li className="list-disc break-words" key={key}>
+                  <li className="list-disc wrap-break-word" key={key}>
                     {item}
                   </li>
                 ))}
@@ -113,15 +241,12 @@ function SidebarUpdateControl() {
 
   const action = state ? resolveDesktopUpdateButtonAction(state) : "none";
   const isDownloading = state?.status === "downloading";
+  const downloadPercent = Math.max(0, Math.min(100, state?.downloadPercent ?? 0));
   const isUpdateState = action !== "none" || isDownloading;
-  const tooltip = isUpdateState
-    ? state
-      ? getDesktopUpdateButtonTooltip(state)
-      : "Update available"
-    : state?.status === "checking"
-      ? "Checking for updates…"
-      : "Check for updates";
+  const tooltip = getSidebarUpdateTooltip(state, isUpdateState);
   const disabled = isUpdateState ? isDesktopUpdateButtonDisabled(state) : !canCheckForUpdate(state);
+  const showNightlyReleaseNotes =
+    isUpdateState && state?.channel === "nightly" && state.releaseNotes.length > 0;
 
   const handleAction = useCallback(async () => {
     const bridge = window.desktopBridge;
@@ -129,35 +254,10 @@ function SidebarUpdateControl() {
     if (disabled || isActionPending) return;
 
     setIsActionPending(true);
+    const clearPending = () => setIsActionPending(false);
 
     if (action === "download") {
-      void bridge
-        .downloadUpdate()
-        .then((result) => {
-          if (result.completed) {
-            showDesktopUpdateDownloadedToast(bridge, result.state);
-          }
-          if (!shouldToastDesktopUpdateActionResult(result)) return;
-          const actionError = getDesktopUpdateActionError(result);
-          if (!actionError) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not download update",
-              description: actionError,
-            }),
-          );
-        })
-        .catch((error) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not start update download",
-              description: error instanceof Error ? error.message : "An unexpected error occurred.",
-            }),
-          );
-        })
-        .finally(() => setIsActionPending(false));
+      startDownloadUpdate(bridge, clearPending);
       return;
     }
 
@@ -168,70 +268,22 @@ function SidebarUpdateControl() {
           getDesktopUpdateInstallConfirmationMessage(state, navigator.platform),
         );
       } catch (error) {
-        setIsActionPending(false);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not confirm update",
-            description: error instanceof Error ? error.message : "Update confirmation failed.",
-          }),
+        clearPending();
+        toastUpdateError(
+          "Could not confirm update",
+          updateActionErrorMessage(error, "Update confirmation failed."),
         );
         return;
       }
       if (!confirmed) {
-        setIsActionPending(false);
+        clearPending();
         return;
       }
-      void bridge
-        .installUpdate()
-        .then((result) => {
-          if (!shouldToastDesktopUpdateActionResult(result)) return;
-          const actionError = getDesktopUpdateActionError(result);
-          if (!actionError) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: actionError,
-            }),
-          );
-        })
-        .catch((error) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: error instanceof Error ? error.message : "An unexpected error occurred.",
-            }),
-          );
-        })
-        .finally(() => setIsActionPending(false));
+      startInstallUpdate(bridge, clearPending);
       return;
     }
 
-    void bridge
-      .checkForUpdate()
-      .then((result) => {
-        if (result.checked) return;
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not check for updates",
-            description:
-              result.state.message ?? "Automatic updates are not available in this build.",
-          }),
-        );
-      })
-      .catch((error) => {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not check for updates",
-            description: error instanceof Error ? error.message : "Update check failed.",
-          }),
-        );
-      })
-      .finally(() => setIsActionPending(false));
+    startCheckForUpdate(bridge, clearPending);
   }, [action, disabled, isActionPending, state]);
 
   return (
@@ -245,13 +297,15 @@ function SidebarUpdateControl() {
               aria-disabled={disabled || isActionPending || undefined}
               disabled={disabled || isActionPending}
               className={cn(
-                "inline-flex size-8 items-center justify-center rounded-full outline-hidden ring-ring transition-colors enabled:cursor-pointer focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-60",
+                "relative inline-flex size-8 items-center justify-center rounded-full outline-hidden ring-ring transition-colors enabled:cursor-pointer focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-60",
                 isUpdateState
                   ? "bg-update-surface text-update-foreground enabled:hover:bg-update/12"
-                  : "text-[var(--sidebar-icon-color)] enabled:hover:bg-sidebar-row-hover enabled:hover:text-sidebar-foreground",
+                  : "text-(--sidebar-icon-color) enabled:hover:bg-sidebar-row-hover enabled:hover:text-sidebar-foreground",
               )}
               onClick={handleAction}
             >
+              {isDownloading ? <DownloadProgressRing percent={downloadPercent} /> : null}
+
               {action === "install" ? (
                 <RotateCwIcon className="size-4" />
               ) : isUpdateState ? (
@@ -267,22 +321,14 @@ function SidebarUpdateControl() {
         <TooltipPopup
           align="center"
           className={
-            isUpdateState && state?.channel === "nightly" && state.releaseNotes.length > 0
+            showNightlyReleaseNotes
               ? // pointer-events-auto overrides the positioner's pointer-events-none so the
                 // release notes stay open (and scrollable) when the cursor moves into them.
                 "pointer-events-auto max-w-none text-balance"
               : undefined
           }
           side="top"
-          style={
-            isUpdateState
-              ? {
-                  background:
-                    "color-mix(in srgb, var(--update) 18%, color-mix(in srgb, var(--popover) var(--glass-opacity), transparent))",
-                  borderColor: "var(--update-foreground)",
-                }
-              : undefined
-          }
+          style={isUpdateState ? UPDATE_AVAILABLE_TOOLTIP_STYLE : undefined}
           variant={isUpdateState ? "glass" : "default"}
         >
           {isUpdateState && state ? (
